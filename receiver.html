@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlexWatch TV Connector</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #050709; overflow: hidden; }
+  body {
+    font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+    color: #fff;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .hidden { display: none !important; }
+
+  /* ---------- Pairing screen ---------- */
+  #pairing {
+    width: 100%; height: 100%;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 22px; padding: 4vh 5vw; text-align: center;
+  }
+  .logo-row { display: flex; align-items: center; gap: 14px; }
+  .logo-tv { width: 54px; height: 54px; }
+  .brand {
+    font-size: 34px; font-weight: 900; letter-spacing: 2px;
+    color: #f5c518; text-shadow: 0 2px 18px rgba(245,197,24,.35);
+  }
+  .hint { font-size: 19px; color: #9aa4b2; }
+  .code {
+    /* fallback first: clamp() unsupported on old TV WebViews */
+    font-size: 110px;
+    font-size: clamp(72px, 14vw, 170px);
+    font-weight: 900; letter-spacing: .22em; text-indent: .22em;
+    color: #fff; line-height: 1;
+    padding: 18px 42px; border-radius: 28px;
+    background: rgba(245,197,24,.06);
+    border: 2px solid rgba(245,197,24,.35);
+    text-shadow: 0 0 40px rgba(245,197,24,.35);
+  }
+  .code.dots { color: #3a4353; text-shadow: none; }
+  .status-row { display: flex; align-items: center; gap: 10px; font-size: 16px; color: #718096; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: #f59e0b; }
+  .dot.online { background: #34d399; box-shadow: 0 0 12px rgba(52,211,153,.8); }
+  .dot.offline { background: #ef4444; }
+  .steps { display: flex; gap: 26px; margin-top: 8px; flex-wrap: wrap; justify-content: center; }
+  .step {
+    display: flex; align-items: center; gap: 10px;
+    background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08);
+    border-radius: 16px; padding: 12px 20px; font-size: 15px; color: #cbd5e1;
+  }
+  .step b { color: #f5c518; margin-right: 2px; }
+  .sub { font-size: 13px; color: #64748b; margin-top: 4px; }
+
+  /* ---------- Toast ---------- */
+  #toast {
+    position: fixed; bottom: 5vh; left: 50%; transform: translateX(-50%);
+    background: #f5c518; color: #050709; font-weight: 900; font-size: 18px;
+    padding: 14px 34px; border-radius: 999px;
+    box-shadow: 0 10px 40px rgba(0,0,0,.6);
+    opacity: 0; transition: opacity .25s ease; pointer-events: none; z-index: 50;
+  }
+  #toast.show { opacity: 1; }
+
+  /* ---------- Player ---------- */
+  /* NOTE: inset:0 is Chrome 87+ — old TV WebViews drop it and the player
+     collapses to a 0-size box (audio keeps playing, video invisible).
+     Use explicit top/left/width/height + JS pixel sizing instead. */
+  #playerWrap {
+    position: fixed; top: 0; left: 0;
+    width: 100%; height: 100%;
+    background: #000; z-index: 40;
+  }
+  #playerFrame {
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%;
+    border: 0;
+  }
+  #nowPlaying {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    padding: 12px 24px; text-align: center;
+    background: rgba(0,0,0,.55); font-size: 15px; color: #cbd5e1; z-index: 45;
+  }
+</style>
+</head>
+<body>
+
+  <!-- Pairing / standby screen -->
+  <div id="pairing">
+    <div class="logo-row">
+      <svg class="logo-tv" viewBox="0 0 24 24" fill="none">
+        <rect x="2" y="4" width="20" height="14" rx="2.5" stroke="#f5c518" stroke-width="2"/>
+        <path d="M9 21h6M12 18v3" stroke="#f5c518" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      <span class="brand">FlexWatch</span>
+    </div>
+
+    <p class="hint">Mobile app me ye 6-digit code daalein</p>
+
+    <div id="code" class="code dots">· · · · · ·</div>
+
+    <div class="status-row">
+      <span id="statusDot" class="dot"></span>
+      <span id="statusText">Internet se connect ho raha hai…</span>
+    </div>
+
+    <div class="steps">
+      <div class="step"><b>1</b> Mobile me FlexWatch kholen</div>
+      <div class="step"><b>2</b> Movie par “Watch on TV” dabaein</div>
+      <div class="step"><b>3</b> Ye code daal kar Play dabaein</div>
+    </div>
+    <p class="sub">Video sirf tab chalega jab mobile se order aaye</p>
+  </div>
+
+  <!-- Player (hidden until a play command arrives) -->
+  <div id="playerWrap" class="hidden">
+    <iframe id="playerFrame" title="player" allow="autoplay *; fullscreen *; encrypted-media *"></iframe>
+    <div id="nowPlaying"></div>
+  </div>
+
+  <div id="toast"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  // =======================================================================
+  // Minimal MQTT 3.1.1 over WebSocket client (same wire format as the
+  // phone app's src/services/cast.js) — ES5, works on old TV WebViews.
+  // =======================================================================
+  var BROKERS = [
+    'ws://broker.emqx.io:8083/mqtt',
+    'ws://test.mosquitto.org:8080/mqtt'
+  ];
+  var TOPIC_PREFIX = 'flexwatch/tv/';
+  var KEEPALIVE = 60;
+
+  function utf8Bytes(str) {
+    var s = encodeURIComponent(String(str)), out = [], i, ch;
+    for (i = 0; i < s.length; i++) {
+      ch = s.charAt(i);
+      if (ch === '%') { out.push(parseInt(s.substr(i + 1, 2), 16)); i += 2; }
+      else { out.push(s.charCodeAt(i)); }
+    }
+    return out;
+  }
+  function utf8Str(bytes) {
+    var s = '', i;
+    for (i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    try { return decodeURIComponent(escape(s)); } catch (e) { return s; }
+  }
+  function remLen(n) {
+    var out = [], v = n, d;
+    do { d = v % 128; v = Math.floor(v / 128); if (v > 0) d |= 128; out.push(d); } while (v > 0);
+    return out;
+  }
+  function encStr(s) {
+    var b = utf8Bytes(s);
+    return [(b.length >> 8) & 255, b.length & 255].concat(b);
+  }
+  function buildConnect(clientId) {
+    var vh = [0x00, 0x04, 0x4d, 0x51, 0x54, 0x54, 0x04, 0x02,
+      (KEEPALIVE >> 8) & 255, KEEPALIVE & 255];
+    var body = vh.concat(encStr(clientId));
+    return [0x10].concat(remLen(body.length)).concat(body);
+  }
+  var packetId = 1;
+  function buildSubscribe(topic) {
+    var pid = packetId++ % 65536 || 1;
+    var body = [(pid >> 8) & 255, pid & 255].concat(encStr(topic)).concat([0x00]);
+    return [0x82].concat(remLen(body.length)).concat(body);
+  }
+  var PINGREQ = [0xc0, 0x00];
+
+  function MqttClient(url, handlers) {
+    var ws = null, opened = false, dead = false, ping = null, buf = [], self = this;
+    var connTimer = null;
+    this.onConnect = handlers.onConnect;
+    this.onMessage = handlers.onMessage;
+    this.onDown = handlers.onDown;
+
+    function send(bytes) {
+      try { if (ws && ws.readyState === 1) ws.send(new Uint8Array(bytes)); } catch (e) {}
+    }
+    function settle(code, body) {
+      var type = code & 0xf0;
+      if (type === 0x20) {                       // CONNACK
+        var rc = body.length > 1 ? body[1] : 5;
+        if (rc === 0) {
+          opened = true;
+          clearTimeout(connTimer);
+          ping = setInterval(function () { send(PINGREQ); }, (KEEPALIVE - 15) * 1000);
+          if (self.onConnect) self.onConnect(self);
+        } else if (self.onDown) self.onDown(new Error('rc=' + rc));
+      } else if (type === 0x30) {                // PUBLISH qos0
+        if (body.length < 2) return;
+        var tlen = (body[0] << 8) | body[1];
+        var start = 2 + tlen;
+        if (body.length < start) return;
+        var payload = body.slice(start);
+        var msg = null;
+        try { msg = JSON.parse(utf8Str(payload)); } catch (e) { msg = null; }
+        if (msg && msg.type && self.onMessage) self.onMessage(msg);
+      }
+      // SUBACK / PINGRESP ignored
+    }
+    function onBytes(arr) {
+      buf = buf.concat(arr);
+      for (;;) {
+        if (buf.length < 2) return;
+        var b1 = buf[0], len = 0, mul = 1, i = 1, complete = false, b;
+        for (; i < buf.length && i <= 4; i++) {
+          b = buf[i];
+          len += (b & 127) * mul; mul *= 128;
+          if (!(b & 128)) { complete = true; break; }
+        }
+        if (!complete) return;
+        var total = i + 1 + len;
+        if (buf.length < total) return;
+        settle(b1, buf.slice(i + 1, total));
+        buf = buf.slice(total);
+      }
+    }
+
+    try { ws = new WebSocket(url, 'mqtt'); }
+    catch (e) { setTimeout(function () { if (self.onDown) self.onDown(e); }, 0); return; }
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = function () { send(buildConnect('fwtv_' + Math.random().toString(16).slice(2, 10) + Date.now().toString(36))); };
+    ws.onmessage = function (ev) {
+      try {
+        var d = ev.data;
+        if (typeof d === 'string') return;
+        var u = d instanceof ArrayBuffer ? new Uint8Array(d) : d;
+        onBytes(Array.prototype.slice.call(u));
+      } catch (e) {}
+    };
+    ws.onerror = function () { down(new Error('socket error')); };
+    ws.onclose = function () { down(new Error('closed')); };
+
+    var connTimer = setTimeout(function () { down(new Error('timeout')); }, 8000);
+
+    function down(err) {
+      if (dead) return;
+      dead = true;
+      clearTimeout(connTimer);
+      clearInterval(ping);
+      try { if (ws) { ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null; ws.close(); } } catch (e) {}
+      ws = null;
+      if (self.onDown) self.onDown(err || new Error('down'));
+    }
+
+    this.subscribe = function (t) { send(buildSubscribe(t)); };
+    this.publish = function (t, payloadStr) { send([0x30].concat(remLen(encStr(t).concat(utf8Bytes(payloadStr)).length)).concat(encStr(t)).concat(utf8Bytes(payloadStr))); };
+    this.end = function () {
+      dead = true;
+      clearTimeout(connTimer);
+      clearInterval(ping);
+      try { if (ws) { ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null; ws.close(); } } catch (e) {}
+      ws = null;
+    };
+  }
+
+  // =======================================================================
+  // Pairing screen UI
+  // =======================================================================
+  var codeEl = document.getElementById('code');
+  var dotEl = document.getElementById('statusDot');
+  var statusEl = document.getElementById('statusText');
+  var pairingEl = document.getElementById('pairing');
+  var playerWrap = document.getElementById('playerWrap');
+  var playerFrame = document.getElementById('playerFrame');
+  var nowPlayingEl = document.getElementById('nowPlaying');
+  var toastEl = document.getElementById('toast');
+  var subEl = document.querySelector('.sub');
+
+  var toastTimer = null;
+  function showToast(text) {
+    toastEl.textContent = text;
+    toastEl.className = 'show';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toastEl.className = ''; }, 4200);
+  }
+
+  // Old TV WebViews sometimes mis-measure 100% height on fixed elements —
+  // force explicit pixel size on the player + iframe and keep it in sync.
+  function sizePlayer() {
+    var w = document.documentElement.clientWidth || window.innerWidth || 1280;
+    var h = document.documentElement.clientHeight || window.innerHeight || 720;
+    playerWrap.style.width = w + 'px';
+    playerWrap.style.height = h + 'px';
+    playerFrame.style.width = w + 'px';
+    playerFrame.style.height = h + 'px';
+  }
+  window.addEventListener('resize', sizePlayer);
+
+  function setStatus(cls, text) {
+    dotEl.className = 'dot' + (cls ? ' ' + cls : '');
+    statusEl.textContent = text;
+  }
+
+  function showCode(code) {
+    var out = '', i;
+    for (i = 0; i < 6; i++) {
+      out += code.charAt(i);
+      if (i < 5) out += ' ';
+    }
+    codeEl.textContent = out;
+    codeEl.className = 'code';
+  }
+
+  // =======================================================================
+  // Cast receiver session
+  // =======================================================================
+  var client = null;
+  var pairCode = null;
+  var stopped = false;
+  var attempt = 0;
+
+  // =======================================================================
+  // STABLE PAIRING CODE — ek device = ek FIXED code.
+  // 3-layer persistence (purane TV WebViews ke liye):
+  //   1. localStorage   — normal case, restart/reload par bhi same
+  //   2. cookie         — localStorage band ho to bhi persist karta hai
+  //   3. device fingerprint — dono fail ho to code DEVICE se derive hota
+  //      hai (canvas + UA + screen ka hash), random nahi — phir bhi fixed.
+  // Reset karne ke liye: TV Settings me app ka "Clear data" karo.
+  // =======================================================================
+  var CODE_KEY = 'fwtv_pair_code';
+  var codeSource = '';
+
+  function readSavedCode() {
+    try {
+      var v = window.localStorage.getItem(CODE_KEY);
+      if (v && /^\d{6}$/.test(v)) { codeSource = 'saved'; return v; }
+    } catch (e) {}
+    try {
+      var m = document.cookie.match(/(?:^|;\s*)fwtv_code=(\d{6})/);
+      if (m) { codeSource = 'cookie'; return m[1]; }
+    } catch (e) {}
+    return null;
+  }
+
+  function saveCode(code) {
+    try { window.localStorage.setItem(CODE_KEY, code); } catch (e) {}
+    try {
+      var d = new Date(Date.now() + 3650 * 864e5);   // ~10 saal
+      document.cookie = 'fwtv_code=' + code + '; expires=' +
+        d.toUTCString() + '; path=/';
+    } catch (e) {}
+  }
+
+  // FNV-1a (ES5-safe, Math.imul ke bina) — 32-bit int
+  function hash32(str) {
+    var h = 2166136261, i;
+    for (i = 0; i < str.length; i++) {
+      h = (h ^ str.charCodeAt(i));
+      h = (h * 16777619) % 4294967296;   // product < 2^53 — exact
+    }
+    return h >>> 0;
+  }
+
+  // Canvas + UA + screen se device fingerprint code
+  function fingerprintCode() {
+    var seed = 'fwtv1';
+    try {
+      var c = document.createElement('canvas');
+      c.width = 240; c.height = 60;
+      var x = c.getContext && c.getContext('2d');
+      if (x) {
+        x.textBaseline = 'top';
+        x.font = '16px Arial';
+        x.fillStyle = '#f60'; x.fillRect(0, 0, 120, 30);
+        x.fillStyle = '#069'; x.fillText('FlexWatch-TV#\u2665', 2, 4);
+        x.fillStyle = 'rgba(102,204,0,0.7)'; x.fillText('FlexWatch-TV#\u2665', 4, 18);
+        seed += c.toDataURL();
+      }
+    } catch (e) { seed += '|nocanvas'; }
+    seed += '|' + (navigator.userAgent || '') +
+            '|' + screen.width + 'x' + screen.height +
+            '|' + (screen.colorDepth || 24) +
+            '|' + (navigator.language || '');
+    return ('000000' + String(hash32(seed) % 1000000)).slice(-6);
+  }
+
+  // Native wrapper (web2apk / FlexWatch TV APK) ke andar chal raha ho to
+  // OS-level ANDROID_ID milta hai — isse code derive hota hai. Storage ka
+  // koi role nahi: restart/reinstall/data-clear — kuch se nahi badlega.
+  function deviceCode() {
+    try {
+      if (window.NativeBridge &&
+          typeof window.NativeBridge.getDeviceId === 'function') {
+        var id = String(window.NativeBridge.getDeviceId() || '');
+        if (id) {
+          codeSource = 'device';
+          return ('000000' + String(hash32('fwtv1|' + id) % 1000000)).slice(-6);
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  // Purane WebViews me addJavascriptInterface ka object page scripts ke
+  // chalne ke BAAD inject ho sakta hai — race na ho, isliye bridge ka
+  // wait karo (max 5s), TABHI code compute karo.
+  function waitNativeBridge(cb) {
+    var tries = 0;
+    (function check() {
+      if (window.NativeBridge &&
+          typeof window.NativeBridge.getDeviceId === 'function') {
+        cb(true);
+      } else if (++tries < 25) {
+        setTimeout(check, 200);
+      } else {
+        cb(false);
+      }
+    })();
+  }
+
+  function newCode() {
+    // 0) Native device ID — APK me hamesha available, sabse trusted
+    var dc = deviceCode();
+    if (dc) { saveCode(dc); return dc; }
+
+    // 1) localStorage / cookie (direct browser me yahi chalta hai)
+    var saved = readSavedCode();
+    if (saved) { saveCode(saved); return saved; }   // cookie me bhi sync
+
+    var storageOk = false;
+    try {
+      window.localStorage.setItem('fwtv_t', '1');
+      storageOk = (window.localStorage.getItem('fwtv_t') === '1');
+      window.localStorage.removeItem('fwtv_t');
+    } catch (e) { storageOk = false; }
+
+    var code;
+    if (storageOk) {
+      code = ('000000' + String(Math.floor(Math.random() * 1000000))).slice(-6);
+      codeSource = 'new';
+    } else {
+      // 3) aakhri fallback: canvas + UA + screen fingerprint
+      code = fingerprintCode();
+      codeSource = 'fp';
+    }
+    saveCode(code);
+    return code;
+  }
+
+  // Screen par chhota lock-indicator — fixed build chal raha hai to restart
+  // ke baad bhi "locked" hi dikhega (purane build me ye text kabhi nahi dikhta).
+  function showLockTag() {
+    if (!subEl) return;
+    var t = { device: 'Code device-se locked \u2714 — kabhi nahi badlega',
+              saved: 'Code locked \u2714 — restart/reconnect par yahi rahega',
+              cookie: 'Code locked \u2714 — restart/reconnect par yahi rahega',
+              'new': 'Code locked \u2714 — ab se har baar yahi rahega',
+              fp: 'Code device-se locked \u2714' };
+    // Original hint text ke aage append karo (replace nahi)
+    if (!subEl.getAttribute('data-base')) {
+      subEl.setAttribute('data-base', subEl.textContent);
+    }
+    subEl.textContent = (t[codeSource] || '') + '  ·  ' +
+      subEl.getAttribute('data-base');
+  }
+
+  function startSession() {
+    if (stopped) return;
+    pairCode = newCode();
+    showCode(pairCode);
+    codeEl.className = 'code';
+    showLockTag();
+
+    var url = BROKERS[attempt % BROKERS.length];
+    setStatus('', 'Internet se connect ho raha hai…');
+
+    client = new MqttClient(url, {
+      onConnect: function (c) {
+        attempt = 0;
+        c.subscribe(TOPIC_PREFIX + pairCode);
+        setStatus('online', 'Ready — mobile se play command bhejein');
+      },
+      onMessage: function (msg) {
+        if (msg.type === 'ping') {
+          try {
+            client.publish(TOPIC_PREFIX + 'probe/' + pairCode, JSON.stringify({ type: 'pong', ts: Date.now() }));
+          } catch (e) {}
+          return;
+        }
+        if (msg.type === 'play' && msg.path && String(msg.path).indexOf('/watch/') === 0) {
+          playOnTv(msg);
+        } else if (msg.type === 'stop') {
+          stopPlayback();
+        } else if (msg.type === 'pause' || msg.type === 'resume') {
+          showToast(msg.type === 'pause' ? 'Pause requested from phone' : 'Resume requested from phone');
+        }
+      },
+      onDown: function () {
+        setStatus('offline', 'Connection cut gaya — dobara try kar rahe hain…');
+        attempt += 1;
+        setTimeout(startSession, Math.min(30000, 2000 * attempt));
+        client = null;
+        return;
+      }
+    });
+  }
+
+  // =======================================================================
+  // Playback — video ONLY plays when the phone sends the play order
+  // =======================================================================
+  var EMBED_BASE = 'https://embedmaster.link/v25mtp1f9gv8bqah1g';
+
+  function buildEmbedUrl(path) {
+    // path like /watch/movie/123  or  /watch/tv/456/2/5
+    var m = String(path).match(/^\/watch\/(movie|tv)\/(\d+)(?:\/(\d+)\/(\d+))?/);
+    if (!m) return null;
+    if (m[1] === 'movie') return EMBED_BASE + '/movie/' + m[2];
+    return EMBED_BASE + '/tv/' + m[2] + '/' + (parseInt(m[3], 10) || 1) + '/' + (parseInt(m[4], 10) || 1);
+  }
+
+  function playOnTv(msg) {
+    var src = buildEmbedUrl(msg.path);
+    if (!src) { showToast('Invalid play command'); return; }
+    sizePlayer(); // explicit px size BEFORE the iframe loads
+    nowPlayingEl.textContent = msg.title ? ('Now playing: ' + msg.title) : '';
+    playerFrame.src = src;
+    playerWrap.className = '';
+    pairingEl.className = 'hidden';
+    // Re-assert size after layout settles (old WebView layout quirks)
+    setTimeout(sizePlayer, 60);
+    setTimeout(sizePlayer, 500);
+    showToast('▶  ' + (msg.title || 'Now playing'));
+  }
+
+  function stopPlayback() {
+    playerFrame.src = 'about:blank';
+    playerWrap.className = 'hidden';
+    pairingEl.className = '';
+    showToast('Playback stopped');
+  }
+
+  // STOP button on TV remote kills playback back to pairing screen
+  document.addEventListener('keydown', function (e) {
+    var k = e.key || '', code = e.keyCode || 0;
+    // Stop / media-stop / back while playing
+    if (playerWrap.className !== 'hidden') {
+      if (k === 'BrowserBack' || code === 461 || code === 10009 || code === 27 || (code === 4 && k === 'GoBack')) {
+        e.preventDefault();
+        stopPlayback();
+      }
+    }
+  });
+
+  window.showToast = showToast;   // native back-press hint uses this
+
+  // Native BACK button hook (called from MainActivity).
+  // Returns true when the press was consumed (player was open -> stop it).
+  // Returns false on the pairing screen so the wrapper can show its exit hint.
+  window.onNativeBack = function () {
+    if (playerWrap.className !== 'hidden') {
+      stopPlayback();
+      return true;
+    }
+    return false;
+  };
+
+  // =======================================================================
+  // Boot — pehle native bridge ka wait, phir session (code lock guarantee)
+  // =======================================================================
+  waitNativeBridge(function () { startSession(); });
+})();
+</script>
+</body>
+</html>
